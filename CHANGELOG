@@ -1,3 +1,14 @@
+## unreleased
+
+### Added
+- feat(evaluation): fit the measurement points in parallel worker processes
+- feat(benchmark): add an Evaluate benchmark command
+
+### Fixed
+- fix(evaluation): do not revive a cancelled run on restart
+- fix(evaluation): reset the Evaluate button after a failed evaluation
+- fix(evaluation): stop the evaluation and its worker processes on quit
+
 ## 0.12.4 - 2026-06-23
 
 ### Fixed

@@ -6,6 +6,7 @@ from matplotlib.colors import Normalize
 from mpl_toolkits.mplot3d.axes3d import Axes3D
 import warnings
 
+import sys
 import time
 
 from PyQt6 import QtWidgets, uic, QtCore
@@ -22,17 +23,58 @@ from bmlab.controllers import EvaluationController
 logger = logging.getLogger(__name__)
 
 
-class Worker(QObject):
-    finished = pyqtSignal()
+class EvaluationRun:
+    """
+    Everything the view keeps for one evaluation run.
 
-    def __init__(self, fkw):
+    Each run has its own abort flag and progress counters, so a run that
+    was cancelled or replaced cannot influence the next one. The run also
+    keeps the thread and the worker, so a thread that still runs is never
+    dropped.
+    """
+
+    def __init__(self, nr_points, blocking=False):
+        self.abort = mp.Value('I', False, lock=True)
+        self.count = mp.Value('I', 0, lock=True)
+        # We have to initialize the value correctly here,
+        # otherwise the evaluation might abort immediately
+        # if max_count is set only after the evaluation_timer
+        # triggered for the first time
+        self.max_count = mp.Value('i', nr_points, lock=True)
+        self.blocking = blocking
+        # Set by the view, in the GUI thread, when the worker returned
+        self.finished = False
+        # How bmlab ended the run: 'completed', 'cancelled', 'superseded',
+        # 'failed' or 'not-started'
+        self.outcome = None
+        # The exception that ended the run, if any
+        self.error = None
+
+
+class Worker(QObject):
+    # Carries the run, so the receiver knows which run has ended
+    finished = pyqtSignal(object)
+
+    def __init__(self, fkw, run):
         super().__init__()
         self.evaluation_controller = EvaluationController()
         self.fkw = fkw
+        self.evaluation_run = run
 
     def run(self):
-        self.evaluation_controller.evaluate(**self.fkw)
-        self.finished.emit()
+        try:
+            self.evaluation_controller.evaluate(**self.fkw)
+        except Exception as error:
+            # An exception must not end the thread without a signal,
+            # the view would wait for this run for ever. The view reports
+            # it from the GUI thread.
+            self.evaluation_run.error = error
+        finally:
+            last_run = self.evaluation_controller.last_run
+            self.evaluation_run.outcome = 'failed' \
+                if self.evaluation_run.error \
+                else getattr(last_run, 'outcome', None)
+            self.finished.emit(self.evaluation_run)
 
 
 class EvaluationView(QtWidgets.QWidget):
@@ -86,17 +128,24 @@ class EvaluationView(QtWidgets.QWidget):
 
         self.evaluation_controller = EvaluationController()
 
+        # The abort flag and the counters of the current run (a new flag
+        # is created for every run, see EvaluationRun)
         self.evaluation_abort = mp.Value('I', False, lock=True)
         self.evaluation_running = False
+        self._current_run = None
+        # Runs whose thread has not finished yet. A running QThread must
+        # not be destroyed, so the view keeps a reference to it.
+        self._runs = []
 
         self.session = Session.get_instance()
 
         self.evaluation_timer = QTimer()
         self.evaluation_timer.timeout.connect(self.refresh_ui)
+        # Leaving the application ends a running evaluation in an orderly
+        # way (also with workers), see stop_evaluation
+        QCoreApplication.instance().aboutToQuit.connect(self.stop_evaluation)
         self.count = None
         self.max_count = None
-        self.thread = None
-        self.worker = None
         # Currently used to determine if we should update the plot
         # Might not be necessary anymore once the plot is fast enough.
         self.plot_count = 0
@@ -474,7 +523,17 @@ class EvaluationView(QtWidgets.QWidget):
             self.refresh_ui()
             return
 
-        self.evaluation_abort.value = False
+        self._forget_finished_runs()
+
+        # Every run has its own abort flag and counters. The cancelled
+        # run may still shut down while the new run starts. It can neither
+        # be revived by the new run nor change its progress.
+        run = EvaluationRun(len(self.session.get_image_keys()), blocking)
+        self._current_run = run
+        self.evaluation_abort = run.abort
+        self.count = run.count
+        self.max_count = run.max_count
+
         self.evaluation_running = True
         self.button_evaluate.setText('Cancel')
         # While the evaluation is running, we
@@ -484,49 +543,109 @@ class EvaluationView(QtWidgets.QWidget):
         self.evaluation_timer.start(500)
 
         self.plot_count = 0
-        self.count = mp.Value('I', 0, lock=True)
-
-        # We have to initialize the value correctly here,
-        # otherwise the evaluation might abort immediately
-        # if max_count is set only after the evaluation_timer
-        # triggered for the first time
-        image_keys = self.session.get_image_keys()
-        self.max_count = mp.Value('i', len(image_keys), lock=True)
 
         dnkw = {
-            "count": self.count,
-            "max_count": self.max_count,
-            "abort": self.evaluation_abort,
+            "count": run.count,
+            "max_count": run.max_count,
+            "abort": run.abort,
         }
 
-        self.thread = QThread()
-        self.worker = Worker(fkw=dnkw)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.worker.finished.connect(self.refresh_ui)
-        self.thread.finished.connect(self.thread.deleteLater)
-        self.thread.start()
+        thread = QThread()
+        worker = Worker(fkw=dnkw, run=run)
+        run.thread = thread
+        run.worker = worker
+        self._runs.append(run)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(self.on_run_finished)
+        thread.finished.connect(self._forget_finished_runs)
+        thread.start()
 
         if blocking:
-            while self.evaluation_running:
+            # Wait until the calculation has ended, not only until the
+            # progress is complete: the results are still finalized then.
+            while not run.finished:
                 QCoreApplication.instance().processEvents()
                 time.sleep(0.1)
+            if run.error is not None:
+                raise run.error
+
+    def on_run_finished(self, run):
+        """
+        The worker of a run returned (GUI thread).
+        """
+        run.finished = True
+        if run.error is not None:
+            logger.error('The evaluation failed: %s', run.error,
+                         exc_info=(type(run.error), run.error,
+                                   run.error.__traceback__))
+        self._forget_finished_runs()
+        # The user has started a newer run in the meantime. The old run
+        # must not change the progress, the button or the plot of the
+        # newer run.
+        if run is not self._current_run:
+            return
+        self.refresh_ui()
+        if run.error is not None and not run.blocking:
+            # No new dialog: report it like every other unhandled error of
+            # the application. A blocking caller (batch evaluation)
+            # gets the exception instead.
+            sys.excepthook(type(run.error), run.error,
+                           run.error.__traceback__)
+
+    def stop_evaluation(self, timeout_ms=10000):
+        """
+        Cancel every evaluation that is still active and wait for its
+        thread. Called when the application quits: the application must
+        not leave a running thread or worker processes behind, and a
+        running QThread must not be destroyed. A cancelled run ends within
+        a fraction of a second and shuts its workers down itself.
+        The wait is bounded, so quitting cannot hang.
+        """
+        runs = list(self._runs)
+        for run in runs:
+            run.abort.value = True
+        # The event loop of the application has ended, so the signal that
+        # normally makes the thread quit would never be delivered.
+        for run in runs:
+            run.thread.quit()
+        deadline = time.monotonic() + timeout_ms / 1000
+        for run in runs:
+            run.thread.wait(max(0, int((deadline - time.monotonic()) * 1000)))
+        self.evaluation_timer.stop()
+        self._forget_finished_runs()
+
+    def _forget_finished_runs(self):
+        """
+        Release the references to threads that have finished. A thread
+        that still runs stays referenced.
+        """
+        running = []
+        for run in self._runs:
+            if run.thread.isFinished():
+                run.thread.wait()
+            else:
+                running.append(run)
+        self._runs = running
 
     def refresh_ui(self):
+        run = self._current_run
         # If evaluation is aborted by user,
-        # couldn't start or is finished,
+        # couldn't start, failed or is finished,
         # we stop the timer
         if self.evaluation_abort.value or\
            self.max_count.value < 0 or\
-           self.count.value >= self.max_count.value:
+           self.count.value >= self.max_count.value or\
+           (run is not None and run.finished):
             self.evaluation_timer.stop()
             self.evaluation_running = False
             self.button_evaluate.setText('Evaluate')
             self.nrBrillouinPeaksGroup.setEnabled(True)
             session = Session.get_instance()
-            if session.evaluation_model().nr_brillouin_peaks > 1:
+            evm = session.evaluation_model()
+            if evm is not None and evm.nr_brillouin_peaks > 1:
                 self.bounds_table.setEnabled(True)
             self.refresh_plot()
 
